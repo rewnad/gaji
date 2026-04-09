@@ -1,0 +1,17 @@
+{
+  "name": "gaji",
+  "module": "index.ts",
+  "type": "module",
+  "bin": {
+    "gaji": "./index.ts"
+  },
+  "scripts": {
+    "build": "bun build ./index.ts --compile --outfile gaji && ln -sf $(pwd)/gaji ~/.local/bin/gaji"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
