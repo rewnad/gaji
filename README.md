@@ -23,7 +23,8 @@ Make sure `~/.local/bin` is in your PATH.
 
 ```bash
 gaji list                    # List current worktrees
-gaji new <name>              # Create a new worktree + branch + tmux session
+gaji new <name>              # Create a new worktree from dev + branch + tmux session
+gaji new <name> --run <cmd>  # Run a command in the new tmux session
 gaji switch <name>           # Switch to a worktree's tmux session
 gaji remove <name>           # Remove worktree, tmux session, and branch
 gaji prune                   # Remove all unused worktrees
@@ -34,10 +35,16 @@ gaji merge <src> <tgt>       # Merge source branch into target worktree
 
 ### `gaji new <name>`
 
-Creates a complete development environment:
-- New git branch
+Creates a complete development environment from the local `dev` branch:
+- New git branch based on `dev`
 - Linked worktree in `~/.local/share/gaji/<repo>/<name>/`
 - Dedicated tmux session
+
+Use `--run <cmd>` to start a command inside the new tmux session:
+
+```bash
+gaji new feature-auth --run "bun install && bun dev"
+```
 
 ### `gaji switch <name>`
 
@@ -55,8 +62,10 @@ Use `--force` to skip validation (useful for fixing partial states).
 ### `gaji prune`
 
 Removes all worktrees that are:
-- Not currently active in tmux
-- In a consistent state (all resources exist)
+- Missing their tmux session
+- Still backed by a git worktree and branch
+
+Use `--force` to remove dirty worktrees and force-delete their branches.
 
 ### `gaji merge <source> <target>`
 

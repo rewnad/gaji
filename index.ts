@@ -4,6 +4,7 @@ const { positionals, values } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
     force: { type: "boolean", default: false },
+    run: { type: "string" },
   },
   allowPositionals: true,
   strict: true,
@@ -45,11 +46,6 @@ async function worktreeExists(branch: string) {
 
 async function tmuxExists(session: string) {
   const result = await Bun.$`tmux has-session -t ${session}`.quiet().nothrow();
-  return result.exitCode === 0;
-}
-
-async function isWorktreeInUse(branch: string) {
-  const result = await Bun.$`tmux list-clients -t ${branch}`.quiet().nothrow();
   return result.exitCode === 0;
 }
 
@@ -110,21 +106,33 @@ async function newWorktree() {
   }
 
   const dir = await worktreeDir(name);
+  const runCommand = values.run;
 
   if (await branchExists(name)) {
     console.error(`error: branch "${name}" already exists`);
     process.exit(1);
   }
 
-  await Bun.$`git branch ${name}`.quiet();
+  if (!await branchExists("dev")) {
+    console.error('error: base branch "dev" does not exist');
+    process.exit(1);
+  }
+
   await Bun.$`mkdir -p ${dir}`.quiet();
-  await Bun.$`git worktree add ${dir} ${name}`.quiet();
+  await Bun.$`git worktree add -b ${name} ${dir} dev`.quiet();
   await Bun.$`tmux new-session -d -s ${name} -c ${dir}`.quiet();
+  if (runCommand) {
+    await Bun.$`tmux send-keys -t ${name} -- ${runCommand} C-m`.quiet();
+  }
 
   console.log(`created worktree: ${name}`);
+  console.log(`  base:     dev`);
   console.log(`  branch:   ${name}`);
   console.log(`  path:     ${dir}`);
   console.log(`  session:  ${name}`);
+  if (runCommand) {
+    console.log(`  run:      ${runCommand}`);
+  }
 }
 
 type ResourceCheck = { branch: boolean; worktree: boolean; tmux: boolean };
@@ -145,6 +153,18 @@ function printCheck(name: string, check: ResourceCheck) {
   console.log(`  worktree: ${mark(check.worktree)} ${check.worktree ? "exists" : "missing"}`);
   console.log(`  tmux:     ${mark(check.tmux)} ${check.tmux ? "exists" : "missing"}`);
   console.log("Aborting. All three must be present to remove.");
+}
+
+function printCommandFailure(label: string, result: { exitCode: number; stdout: Buffer; stderr: Buffer }) {
+  console.log(`    ${label} failed (exit ${result.exitCode})`);
+  const output = [result.stderr.toString().trim(), result.stdout.toString().trim()]
+    .filter(Boolean)
+    .join("\n");
+  if (output) {
+    for (const line of output.split("\n")) {
+      console.log(`      ${line}`);
+    }
+  }
 }
 
 async function removeWorktree() {
@@ -207,38 +227,57 @@ async function pruneWorktrees() {
 
   let removed = 0;
   let skipped = 0;
+  let failed = 0;
 
   for (const wt of worktrees) {
-    const check = await checkResources(wt.branch);
-    const allExist = check.branch && check.worktree && check.tmux;
+    const [hasBranch, hasTmux] = await Promise.all([
+      branchExists(wt.branch),
+      tmuxExists(wt.branch),
+    ]);
 
-    if (!allExist) {
-      const missing: string[] = [];
-      if (!check.branch) missing.push("branch missing");
-      if (!check.worktree) missing.push("worktree missing");
-      if (!check.tmux) missing.push("tmux missing");
-      console.log(`  ⚠ ${wt.branch} — skipped (${missing.join(", ")})`);
+    if (!hasBranch) {
+      console.log(`  ⚠ ${wt.branch} — skipped (branch missing)`);
       skipped++;
       continue;
     }
 
-    const inUse = await isWorktreeInUse(wt.branch);
-    if (inUse) {
-      console.log(`  ⚠ ${wt.branch} — skipped (session is active)`);
+    if (hasTmux) {
+      console.log(`  ⚠ ${wt.branch} — skipped (tmux session exists)`);
       skipped++;
       continue;
     }
 
-    const dir = await worktreeDir(wt.branch);
-    await Bun.$`git worktree remove ${dir}`.quiet();
-    await Bun.$`tmux kill-session -t ${wt.branch}`.quiet().nothrow();
-    await Bun.$`git branch -d ${wt.branch}`.quiet();
+    console.log(`  ${wt.branch} — removing (${wt.path})`);
+
+    const removeResult = values.force
+      ? await Bun.$`git worktree remove --force ${wt.path}`.quiet().nothrow()
+      : await Bun.$`git worktree remove ${wt.path}`.quiet().nothrow();
+    if (removeResult.exitCode !== 0) {
+      printCommandFailure("git worktree remove", removeResult);
+      failed++;
+      continue;
+    }
+
+    const branchResult = values.force
+      ? await Bun.$`git branch -D ${wt.branch}`.quiet().nothrow()
+      : await Bun.$`git branch -d ${wt.branch}`.quiet().nothrow();
+    if (branchResult.exitCode !== 0) {
+      printCommandFailure(values.force ? "git branch -D" : "git branch -d", branchResult);
+      failed++;
+      continue;
+    }
+
     console.log(`  ✓ ${wt.branch} — removed`);
     removed++;
   }
 
-  await Bun.$`git worktree prune`.quiet();
-  console.log(`\ndone: ${removed} removed, ${skipped} skipped`);
+  const pruneResult = await Bun.$`git worktree prune`.quiet().nothrow();
+  if (pruneResult.exitCode !== 0) {
+    printCommandFailure("git worktree prune", pruneResult);
+    failed++;
+  }
+
+  console.log(`\ndone: ${removed} removed, ${skipped} skipped, ${failed} failed`);
 }
 
 async function mergeWorktree() {
@@ -283,14 +322,16 @@ async function main() {
 
 usage:
   gaji list              list current worktrees
-  gaji new <name>        create a new worktree and tmux session
+  gaji new <name>        create a new worktree from dev and tmux session
+  gaji new <name> --run <cmd>
   gaji remove <name>     remove a worktree, tmux session, and branch
   gaji prune             remove all unused worktrees
   gaji merge <src> <tgt> merge source branch into target
   gaji switch <name>      switch to worktree tmux session
 
 options:
-  --force                skip validation on remove (clean up partial state)`);
+  --run <cmd>            run a command in the new tmux session
+  --force                skip remove validation; force dirty prune cleanup`);
   }
 }
 
