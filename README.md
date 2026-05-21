@@ -51,9 +51,22 @@ Use `--run <cmd>` to start a command inside the new tmux session:
 gaji new feature-auth --run "bun install && bun dev"
 ```
 
-Use `.gaji/config.sh` for custom tmux windows and panes. The script runs from the
-new worktree directory after the tmux session is created and receives these
-environment variables:
+#### Configuring `.gaji/config.sh`
+
+Use `.gaji/config.sh` for custom tmux windows, panes, and startup commands. This
+is the canonical setup hook: when the file exists, `gaji new <name>` runs it
+automatically after creating the tmux session.
+
+Create the file in your repository:
+
+```bash
+mkdir -p .gaji
+$EDITOR .gaji/config.sh
+chmod +x .gaji/config.sh
+```
+
+The script runs from the new worktree directory and receives these environment
+variables:
 
 - `GAJI_SESSION` — tmux session name
 - `GAJI_DIR` — worktree directory
@@ -66,6 +79,12 @@ Example:
 gaji new feature-auth
 ```
 
+In tmux terminology, tabs are called windows. Each window can have one or more
+panes. This example creates two windows:
+
+- `code`: left pane runs `nvim`, right pane runs `opencode`
+- `dev`: left pane starts the app and opens it in the browser, right pane is empty
+
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -73,18 +92,41 @@ set -euo pipefail
 s="$GAJI_SESSION"
 d="$GAJI_DIR"
 
-app_pane="$(tmux display-message -p -t "$s:" '#{pane_id}')"
-tmux rename-window -t "$app_pane" app
-tmux send-keys -t "$app_pane" "bun dev" C-m
+# Window 1: nvim + opencode
+editor_pane="$(tmux display-message -p -t "$s:" '#{pane_id}')"
+tmux rename-window -t "$editor_pane" code
+tmux send-keys -t "$editor_pane" "nvim" C-m
 
-code_pane="$(tmux new-window -P -F '#{pane_id}' -t "$s:" -n code -c "$d")"
-tmux send-keys -t "$code_pane" "nvim" C-m
-agent_pane="$(tmux split-window -h -P -F '#{pane_id}' -t "$code_pane" -c "$d")"
+agent_pane="$(tmux split-window -h -P -F '#{pane_id}' -t "$editor_pane" -c "$d")"
 tmux send-keys -t "$agent_pane" "opencode" C-m
 
-tmux select-pane -t "$code_pane"
+tmux select-layout -t "$s:code" even-horizontal
+
+# Window 2: dev command + empty shell
+dev_pane="$(tmux new-window -P -F '#{pane_id}' -t "$s:" -n dev -c "$d")"
+app_port="${APP_PORT:-3211}"
+bm_port="${BM_PORT:-3210}"
+dev_cmd="APP_PORT=$app_port BM_PORT=$bm_port bash -lc '(until curl -fsS http://localhost:$app_port >/dev/null 2>&1; do sleep 0.5; done; xdg-open http://localhost:$app_port >/dev/null 2>&1 &) && bun generate && bun i && sleep 1 && bun run dev:app:all'"
+tmux send-keys -t "$dev_pane" "$dev_cmd" C-m
+
+empty_pane="$(tmux split-window -h -P -F '#{pane_id}' -t "$dev_pane" -c "$d")"
+tmux select-pane -t "$empty_pane"
+
+tmux select-layout -t "$s:dev" even-horizontal
+
+# Start focused on nvim.
 tmux select-window -t "$s:code"
+tmux select-pane -t "$editor_pane"
 ```
+
+Useful tmux commands for setup scripts:
+
+- `tmux rename-window -t <pane> <name>` renames the current window.
+- `tmux new-window -P -F '#{pane_id}' ...` creates a window and prints its first pane id.
+- `tmux split-window -h` creates a left/right split.
+- `tmux split-window -v` creates a top/bottom split.
+- `tmux send-keys -t <pane> "command" C-m` types a command and presses enter.
+- `tmux select-window` and `tmux select-pane` choose what is focused when you attach.
 
 Use `--setup <script>` to override the default setup script for one run. Relative
 script paths are resolved from the repository root before anything is created.
