@@ -1,3 +1,4 @@
+import { isAbsolute, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
 const { positionals, values } = parseArgs({
@@ -5,6 +6,8 @@ const { positionals, values } = parseArgs({
   options: {
     force: { type: "boolean", default: false },
     run: { type: "string" },
+    setup: { type: "string" },
+    "no-setup": { type: "boolean", default: false },
   },
   allowPositionals: true,
   strict: true,
@@ -13,14 +16,15 @@ const { positionals, values } = parseArgs({
 const cmd = positionals[0];
 const name = positionals[1];
 const target = positionals[2];
+const defaultSetupScript = ".gaji/config.sh";
 
-async function sh(cmd: TemplateStringsArray, ...args: string[]) {
-  return Bun.$`${cmd.raw[0]} ${args}`.quiet();
+async function getRepoRoot() {
+  const result = await Bun.$`git rev-parse --show-toplevel`.quiet();
+  return result.text().trim();
 }
 
 async function getRepoBasename() {
-  const result = await Bun.$`git rev-parse --show-toplevel`.quiet();
-  const top = result.text().trim();
+  const top = await getRepoRoot();
   return top.split("/").pop()!;
 }
 
@@ -31,6 +35,25 @@ async function worktreeDir(branch: string) {
 
 function homedir() {
   return process.env.HOME || process.env.USERPROFILE || "/tmp";
+}
+
+async function resolveSetupScript(script: string) {
+  const repoRoot = await getRepoRoot();
+  const scriptPath = isAbsolute(script) ? script : resolve(repoRoot, script);
+  const exists = await Bun.file(scriptPath).exists();
+
+  if (!exists) {
+    console.error(`error: setup script not found: ${scriptPath}`);
+    process.exit(1);
+  }
+
+  return scriptPath;
+}
+
+async function findDefaultSetupScript() {
+  const repoRoot = await getRepoRoot();
+  const scriptPath = resolve(repoRoot, defaultSetupScript);
+  return (await Bun.file(scriptPath).exists()) ? scriptPath : null;
 }
 
 async function branchExists(branch: string) {
@@ -80,7 +103,9 @@ async function switchWorktree() {
   if (!hasTmux && hasWorktree) {
     const dir = await resolveWorktreeDir(name);
     if (!dir) {
-      console.error(`error: could not resolve worktree directory for "${name}"`);
+      console.error(
+        `error: could not resolve worktree directory for "${name}"`,
+      );
       process.exit(1);
     }
     await Bun.$`tmux new-session -d -s ${name} -c ${dir}`.quiet();
@@ -107,13 +132,31 @@ async function newWorktree() {
 
   const dir = await worktreeDir(name);
   const runCommand = values.run;
+  const setupScript = values.setup;
+  const noSetup = values["no-setup"];
+
+  if (runCommand && setupScript) {
+    console.error("error: --run and --setup cannot be used together");
+    process.exit(1);
+  }
+
+  if (setupScript && noSetup) {
+    console.error("error: --setup and --no-setup cannot be used together");
+    process.exit(1);
+  }
+
+  const setupScriptPath = setupScript
+    ? await resolveSetupScript(setupScript)
+    : !runCommand && !noSetup
+      ? await findDefaultSetupScript()
+      : null;
 
   if (await branchExists(name)) {
     console.error(`error: branch "${name}" already exists`);
     process.exit(1);
   }
 
-  if (!await branchExists("dev")) {
+  if (!(await branchExists("dev"))) {
     console.error('error: base branch "dev" does not exist');
     process.exit(1);
   }
@@ -121,6 +164,26 @@ async function newWorktree() {
   await Bun.$`mkdir -p ${dir}`.quiet();
   await Bun.$`git worktree add -b ${name} ${dir} dev`.quiet();
   await Bun.$`tmux new-session -d -s ${name} -c ${dir}`.quiet();
+
+  if (setupScriptPath) {
+    const setupResult = await Bun.$`bash ${setupScriptPath}`
+      .cwd(dir)
+      .env({
+        ...process.env,
+        GAJI_SESSION: name,
+        GAJI_DIR: dir,
+        GAJI_BRANCH: name,
+        GAJI_BASE: "dev",
+      })
+      .quiet()
+      .nothrow();
+    if (setupResult.exitCode !== 0) {
+      console.error("error: created worktree, but setup script failed");
+      printCommandFailure("setup script", setupResult);
+      process.exit(1);
+    }
+  }
+
   if (runCommand) {
     await Bun.$`tmux send-keys -t ${name} -- ${runCommand} C-m`.quiet();
   }
@@ -132,6 +195,9 @@ async function newWorktree() {
   console.log(`  session:  ${name}`);
   if (runCommand) {
     console.log(`  run:      ${runCommand}`);
+  }
+  if (setupScriptPath) {
+    console.log(`  setup:    ${setupScriptPath}`);
   }
 }
 
@@ -149,15 +215,27 @@ async function checkResources(branch: string): Promise<ResourceCheck> {
 function printCheck(name: string, check: ResourceCheck) {
   const mark = (exists: boolean) => (exists ? "✓" : "✗");
   console.log(`error: incomplete state for "${name}":`);
-  console.log(`  branch:   ${mark(check.branch)} ${check.branch ? "exists" : "missing"}`);
-  console.log(`  worktree: ${mark(check.worktree)} ${check.worktree ? "exists" : "missing"}`);
-  console.log(`  tmux:     ${mark(check.tmux)} ${check.tmux ? "exists" : "missing"}`);
+  console.log(
+    `  branch:   ${mark(check.branch)} ${check.branch ? "exists" : "missing"}`,
+  );
+  console.log(
+    `  worktree: ${mark(check.worktree)} ${check.worktree ? "exists" : "missing"}`,
+  );
+  console.log(
+    `  tmux:     ${mark(check.tmux)} ${check.tmux ? "exists" : "missing"}`,
+  );
   console.log("Aborting. All three must be present to remove.");
 }
 
-function printCommandFailure(label: string, result: { exitCode: number; stdout: Buffer; stderr: Buffer }) {
+function printCommandFailure(
+  label: string,
+  result: { exitCode: number; stdout: Buffer; stderr: Buffer },
+) {
   console.log(`    ${label} failed (exit ${result.exitCode})`);
-  const output = [result.stderr.toString().trim(), result.stdout.toString().trim()]
+  const output = [
+    result.stderr.toString().trim(),
+    result.stdout.toString().trim(),
+  ]
     .filter(Boolean)
     .join("\n");
   if (output) {
@@ -262,7 +340,10 @@ async function pruneWorktrees() {
       ? await Bun.$`git branch -D ${wt.branch}`.quiet().nothrow()
       : await Bun.$`git branch -d ${wt.branch}`.quiet().nothrow();
     if (branchResult.exitCode !== 0) {
-      printCommandFailure(values.force ? "git branch -D" : "git branch -d", branchResult);
+      printCommandFailure(
+        values.force ? "git branch -D" : "git branch -d",
+        branchResult,
+      );
       failed++;
       continue;
     }
@@ -277,7 +358,9 @@ async function pruneWorktrees() {
     failed++;
   }
 
-  console.log(`\ndone: ${removed} removed, ${skipped} skipped, ${failed} failed`);
+  console.log(
+    `\ndone: ${removed} removed, ${skipped} skipped, ${failed} failed`,
+  );
 }
 
 async function mergeWorktree() {
@@ -292,7 +375,7 @@ async function mergeWorktree() {
     process.exit(1);
   }
 
-  if (!await branchExists(name)) {
+  if (!(await branchExists(name))) {
     console.error(`error: source branch "${name}" does not exist`);
     process.exit(1);
   }
@@ -324,6 +407,8 @@ usage:
   gaji list              list current worktrees
   gaji new <name>        create a new worktree from dev and tmux session
   gaji new <name> --run <cmd>
+  gaji new <name> --setup <script>
+  gaji new <name> --no-setup
   gaji remove <name>     remove a worktree, tmux session, and branch
   gaji prune             remove all unused worktrees
   gaji merge <src> <tgt> merge source branch into target
@@ -331,6 +416,8 @@ usage:
 
 options:
   --run <cmd>            run a command in the new tmux session
+  --setup <script>       run a tmux setup script after session creation
+  --no-setup             skip automatic .gaji/config.sh setup
   --force                skip remove validation; force dirty prune cleanup`);
   }
 }
